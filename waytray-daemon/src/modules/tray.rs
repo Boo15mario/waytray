@@ -1,8 +1,11 @@
 //! Tray module - wraps the existing StatusNotifierItem functionality as a module
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
+use tokio::time::{self, Duration, MissedTickBehavior};
 use zbus::Connection;
 
 use crate::cache::ItemCache;
@@ -47,33 +50,47 @@ impl TrayModule {
         // Add actions based on item capabilities
         if item.item_is_menu {
             // Menu-only items just have a context menu action
-            module_item.actions.push(ItemAction::default_action(
-                "context_menu",
-                "Show Menu",
-            ));
+            module_item
+                .actions
+                .push(ItemAction::default_action("context_menu", "Show Menu"));
         } else {
             // Regular items have activate as default
-            module_item.actions.push(ItemAction::default_action(
-                "activate",
-                "Activate",
-            ));
-            module_item.actions.push(ItemAction::new(
-                "secondary_activate",
-                "Secondary Action",
-            ));
+            module_item
+                .actions
+                .push(ItemAction::default_action("activate", "Activate"));
+            module_item
+                .actions
+                .push(ItemAction::new("secondary_activate", "Secondary Action"));
         }
 
         // All items with a menu can show context menu
         if item.has_menu {
             if !item.item_is_menu {
-                module_item.actions.push(ItemAction::new(
-                    "context_menu",
-                    "Show Menu",
-                ));
+                module_item
+                    .actions
+                    .push(ItemAction::new("context_menu", "Show Menu"));
             }
         }
 
         module_item
+    }
+
+
+    fn module_items_equal_ignoring_tooltip(a: &[ModuleItem], b: &[ModuleItem]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+
+        a.iter().zip(b.iter()).all(|(left, right)| {
+            left.id == right.id
+                && left.module == right.module
+                && left.label == right.label
+                && left.icon_name == right.icon_name
+                && left.icon_pixmap == right.icon_pixmap
+                && left.icon_width == right.icon_width
+                && left.icon_height == right.icon_height
+                && left.actions == right.actions
+        })
     }
 
     /// Get the underlying host for direct access (used by dbus_service for backwards compat)
@@ -124,10 +141,9 @@ impl Module for TrayModule {
         }
 
         // Watch for D-Bus name changes
-        if let Err(e) = crate::host::watch_name_changes(
-            self.connection.clone(),
-            self.cache.clone(),
-        ).await {
+        if let Err(e) =
+            crate::host::watch_name_changes(self.connection.clone(), self.cache.clone()).await
+        {
             tracing::warn!("Failed to set up name change watcher: {}", e);
         }
 
@@ -137,12 +153,29 @@ impl Module for TrayModule {
             .iter()
             .map(TrayModule::tray_item_to_module_item)
             .collect();
-        ctx.send_items("tray", module_items);
+        ctx.send_items("tray", module_items.clone());
+        let mut last_sent = Some(module_items);
 
         // Subscribe to cache events and forward them to the module context
         let mut receiver = self.cache.subscribe();
 
         tracing::info!("Tray module started");
+
+        // Coalesce bursts of tray updates to avoid flooding downstream with
+        // full snapshot refreshes on every single signal.
+        let mut refresh_pending = false;
+        let mut refresh_tick = time::interval(Duration::from_millis(250));
+        refresh_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // Detect and rate-limit tooltip-only update floods (e.g. apps updating
+        // progress text many times per second). Normal updates still flow through.
+        let mut tooltip_only_change_times: VecDeque<Instant> = VecDeque::new();
+        let tooltip_flood_window = Duration::from_secs(2);
+        let tooltip_flood_threshold = 6usize;
+        let tooltip_flood_cooldown = Duration::from_secs(10);
+        let tooltip_flood_emit_interval = Duration::from_secs(5);
+        let mut tooltip_flood_until: Option<Instant> = None;
+        let mut last_tooltip_publish: Option<Instant> = None;
 
         // Run event loop directly (not spawned) so start() doesn't return
         loop {
@@ -154,29 +187,97 @@ impl Module for TrayModule {
                 result = receiver.recv() => {
                     match result {
                         Ok(_event) => {
-                            // Get all items and convert to module items
-                            let tray_items = self.cache.get_all().await;
-                            let module_items: Vec<ModuleItem> = tray_items
-                                .iter()
-                                .map(TrayModule::tray_item_to_module_item)
-                                .collect();
-
-                            ctx.send_items("tray", module_items);
+                            refresh_pending = true;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Tray module lagged by {} events", n);
-                            // Resync by getting all items
-                            let tray_items = self.cache.get_all().await;
-                            let module_items: Vec<ModuleItem> = tray_items
-                                .iter()
-                                .map(TrayModule::tray_item_to_module_item)
-                                .collect();
-                            ctx.send_items("tray", module_items);
+                            refresh_pending = true;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             tracing::info!("Tray module cache channel closed");
                             break;
                         }
+                    }
+                }
+                _ = refresh_tick.tick() => {
+                    if refresh_pending {
+                        let tray_items = self.cache.get_all().await;
+                        let module_items: Vec<ModuleItem> = tray_items
+                            .iter()
+                            .map(TrayModule::tray_item_to_module_item)
+                            .collect();
+
+                        let now = Instant::now();
+                        let mut should_send = false;
+                        let mut tooltip_only_change = false;
+
+                        match last_sent.as_ref() {
+                            None => {
+                                should_send = true;
+                            }
+                            Some(previous) => {
+                                let full_changed = previous != &module_items;
+                                if full_changed {
+                                    let changed_beyond_tooltip =
+                                        !TrayModule::module_items_equal_ignoring_tooltip(
+                                            previous,
+                                            &module_items,
+                                        );
+
+                                    if changed_beyond_tooltip {
+                                        should_send = true;
+                                        tooltip_only_change_times.clear();
+                                        tooltip_flood_until = None;
+                                    } else {
+                                        tooltip_only_change = true;
+
+                                        tooltip_only_change_times.push_back(now);
+                                        while let Some(front) = tooltip_only_change_times.front() {
+                                            if now.duration_since(*front) > tooltip_flood_window {
+                                                tooltip_only_change_times.pop_front();
+                                            } else {
+                                                break;
+                                            }
+                                        }
+
+                                        if tooltip_only_change_times.len() >= tooltip_flood_threshold {
+                                            let already_in_flood =
+                                                tooltip_flood_until.map(|until| until > now).unwrap_or(false);
+                                            tooltip_flood_until = Some(now + tooltip_flood_cooldown);
+                                            if !already_in_flood {
+                                                tracing::debug!(
+                                                    "Detected tray tooltip flood; throttling tooltip-only updates to every {}s",
+                                                    tooltip_flood_emit_interval.as_secs()
+                                                );
+                                            }
+                                        }
+
+                                        let in_flood =
+                                            tooltip_flood_until.map(|until| until > now).unwrap_or(false);
+                                        if in_flood {
+                                            should_send = last_tooltip_publish
+                                                .map(|last| {
+                                                    now.duration_since(last)
+                                                        >= tooltip_flood_emit_interval
+                                                })
+                                                .unwrap_or(true);
+                                        } else {
+                                            should_send = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if should_send {
+                            ctx.send_items("tray", module_items.clone());
+                            last_sent = Some(module_items);
+                            if tooltip_only_change {
+                                last_tooltip_publish = Some(now);
+                            }
+                        }
+
+                        refresh_pending = false;
                     }
                 }
             }
@@ -230,7 +331,10 @@ impl Module for TrayModule {
         true
     }
 
-    async fn get_menu_items(&self, item_id: &str) -> anyhow::Result<Vec<crate::dbusmenu::MenuItem>> {
+    async fn get_menu_items(
+        &self,
+        item_id: &str,
+    ) -> anyhow::Result<Vec<crate::dbusmenu::MenuItem>> {
         // Parse the item ID - format is "tray:{original_id}"
         let original_id = item_id
             .strip_prefix("tray:")

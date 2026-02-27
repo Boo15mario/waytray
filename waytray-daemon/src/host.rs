@@ -4,8 +4,8 @@
 //! It connects to the StatusNotifierWatcher (either external or our own) and
 //! listens for item registration/unregistration signals.
 
-use std::sync::Arc;
 use futures::StreamExt;
+use std::sync::Arc;
 use zbus::connection::Connection;
 use zbus::fdo::DBusProxy;
 use zbus::names::WellKnownName;
@@ -121,7 +121,9 @@ impl Host {
     /// Register ourselves with the StatusNotifierWatcher
     async fn register_with_watcher(&self) -> anyhow::Result<()> {
         let watcher = StatusNotifierWatcherProxy::new(&self.connection).await?;
-        watcher.register_status_notifier_host(&self.host_name).await?;
+        watcher
+            .register_status_notifier_host(&self.host_name)
+            .await?;
         tracing::info!("Registered as StatusNotifierHost: {}", self.host_name);
         Ok(())
     }
@@ -197,16 +199,25 @@ impl Host {
         // Fetch item properties
         let item = fetch_item_properties(&proxy, service, &bus_name, &object_path).await?;
 
-        // Add to cache
-        self.cache.upsert(item).await;
+        // Add/update in cache
+        let is_new = self.cache.upsert(item).await;
 
-        // Set up signal handlers for property changes
-        self.setup_property_signals(
-            service.to_string(),
-            bus_name.to_string(),
-            object_path.to_string(),
-        )
-        .await?;
+        // Only set up signal handlers for new items.
+        // Some applications re-register the same item repeatedly, and creating
+        // duplicate signal tasks can cause event amplification and instability.
+        if is_new {
+            self.setup_property_signals(
+                service.to_string(),
+                bus_name.to_string(),
+                object_path.to_string(),
+            )
+            .await?;
+        } else {
+            tracing::debug!(
+                "Tray item {} already tracked, skipped duplicate signal setup",
+                service
+            );
+        }
 
         Ok(())
     }
@@ -240,7 +251,10 @@ impl Host {
             while new_title.next().await.is_some() {
                 // Check if item still exists in cache, exit if removed
                 if cache_title.get(&service_title).await.is_none() {
-                    tracing::debug!("Item {} removed, stopping title signal handler", service_title);
+                    tracing::debug!(
+                        "Item {} removed, stopping title signal handler",
+                        service_title
+                    );
                     break;
                 }
 
@@ -256,7 +270,11 @@ impl Host {
                         }
                     },
                     Err(e) => {
-                        tracing::debug!("Failed to create proxy builder for {}: {}", service_title, e);
+                        tracing::debug!(
+                            "Failed to create proxy builder for {}: {}",
+                            service_title,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -280,7 +298,10 @@ impl Host {
             while new_icon.next().await.is_some() {
                 // Check if item still exists in cache, exit if removed
                 if cache_icon.get(&service_icon).await.is_none() {
-                    tracing::debug!("Item {} removed, stopping icon signal handler", service_icon);
+                    tracing::debug!(
+                        "Item {} removed, stopping icon signal handler",
+                        service_icon
+                    );
                     break;
                 }
 
@@ -296,13 +317,21 @@ impl Host {
                         }
                     },
                     Err(e) => {
-                        tracing::debug!("Failed to create proxy builder for {}: {}", service_icon, e);
+                        tracing::debug!(
+                            "Failed to create proxy builder for {}: {}",
+                            service_icon,
+                            e
+                        );
                         continue;
                     }
                 };
 
-                let icon_name = proxy.icon_name().await.ok();
-                let (pixmap, width, height) = fetch_icon_pixmap(&proxy).await;
+                let icon_name = proxy.icon_name().await.ok().filter(|s| !s.is_empty());
+                let (pixmap, width, height) = if icon_name.is_some() {
+                    (None, 0, 0)
+                } else {
+                    fetch_icon_pixmap(&proxy).await
+                };
                 cache_icon
                     .update_icon(&service_icon, icon_name, pixmap, width, height)
                     .await;
@@ -318,7 +347,10 @@ impl Host {
             while let Some(signal) = new_status.next().await {
                 // Check if item still exists in cache, exit if removed
                 if cache_status.get(&service_status).await.is_none() {
-                    tracing::debug!("Item {} removed, stopping status signal handler", service_status);
+                    tracing::debug!(
+                        "Item {} removed, stopping status signal handler",
+                        service_status
+                    );
                     break;
                 }
 
@@ -328,7 +360,11 @@ impl Host {
                         cache_status.update_status(&service_status, status).await;
                     }
                     Err(e) => {
-                        tracing::debug!("Failed to parse status signal for {}: {}", service_status, e);
+                        tracing::debug!(
+                            "Failed to parse status signal for {}: {}",
+                            service_status,
+                            e
+                        );
                     }
                 }
             }
@@ -346,7 +382,10 @@ impl Host {
             while new_tooltip.next().await.is_some() {
                 // Check if item still exists in cache, exit if removed
                 if cache_tooltip.get(&service_tooltip).await.is_none() {
-                    tracing::debug!("Item {} removed, stopping tooltip signal handler", service_tooltip);
+                    tracing::debug!(
+                        "Item {} removed, stopping tooltip signal handler",
+                        service_tooltip
+                    );
                     break;
                 }
 
@@ -362,13 +401,19 @@ impl Host {
                         }
                     },
                     Err(e) => {
-                        tracing::debug!("Failed to create proxy builder for {}: {}", service_tooltip, e);
+                        tracing::debug!(
+                            "Failed to create proxy builder for {}: {}",
+                            service_tooltip,
+                            e
+                        );
                         continue;
                     }
                 };
 
                 let tooltip = fetch_tooltip(&proxy).await;
-                cache_tooltip.update_tooltip(&service_tooltip, tooltip).await;
+                cache_tooltip
+                    .update_tooltip(&service_tooltip, tooltip)
+                    .await;
             }
         });
 
@@ -430,12 +475,7 @@ impl Host {
     }
 
     /// Scroll on an item
-    pub async fn scroll_item(
-        &self,
-        id: &str,
-        delta: i32,
-        orientation: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn scroll_item(&self, id: &str, delta: i32, orientation: &str) -> anyhow::Result<()> {
         let item = self
             .cache
             .get(id)
@@ -463,10 +503,7 @@ impl Host {
     }
 
     /// Get menu items for a tray item via DBusMenu
-    pub async fn get_menu_items(
-        &self,
-        id: &str,
-    ) -> anyhow::Result<Vec<crate::dbusmenu::MenuItem>> {
+    pub async fn get_menu_items(&self, id: &str) -> anyhow::Result<Vec<crate::dbusmenu::MenuItem>> {
         let item = self
             .cache
             .get(id)
@@ -482,11 +519,7 @@ impl Host {
     }
 
     /// Activate a menu item by sending a "clicked" event
-    pub async fn activate_menu_item(
-        &self,
-        id: &str,
-        menu_item_id: i32,
-    ) -> anyhow::Result<()> {
+    pub async fn activate_menu_item(&self, id: &str, menu_item_id: i32) -> anyhow::Result<()> {
         let item = self
             .cache
             .get(id)
@@ -498,8 +531,13 @@ impl Host {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Item has no menu: {}", id))?;
 
-        crate::dbusmenu::activate_menu_item(&self.connection, &item.bus_name, menu_path, menu_item_id)
-            .await
+        crate::dbusmenu::activate_menu_item(
+            &self.connection,
+            &item.bus_name,
+            menu_path,
+            menu_item_id,
+        )
+        .await
     }
 }
 
@@ -560,14 +598,21 @@ async fn fetch_item_properties(
 ) -> anyhow::Result<TrayItem> {
     let id = proxy.id().await.unwrap_or_else(|_| service.to_string());
     let title = proxy.title().await.unwrap_or_else(|_| id.clone());
-    let status_str = proxy.status().await.unwrap_or_else(|_| "Active".to_string());
+    let status_str = proxy
+        .status()
+        .await
+        .unwrap_or_else(|_| "Active".to_string());
     let category_str = proxy
         .category()
         .await
         .unwrap_or_else(|_| "ApplicationStatus".to_string());
     let icon_name = proxy.icon_name().await.ok().filter(|s| !s.is_empty());
 
-    let (icon_pixmap, icon_width, icon_height) = fetch_icon_pixmap(proxy).await;
+    let (icon_pixmap, icon_width, icon_height) = if icon_name.is_some() {
+        (None, 0, 0)
+    } else {
+        fetch_icon_pixmap(proxy).await
+    };
 
     let tooltip = fetch_tooltip(proxy).await;
 
@@ -597,8 +642,14 @@ async fn fetch_item_properties(
 async fn fetch_icon_pixmap(proxy: &StatusNotifierItemProxy<'_>) -> (Option<Vec<u8>>, u32, u32) {
     match proxy.icon_pixmap().await {
         Ok(pixmaps) if !pixmaps.is_empty() => {
-            // Get the largest pixmap
-            if let Some((width, height, data)) = pixmaps.into_iter().max_by_key(|(w, h, _)| w * h) {
+            // Keep only sane positive dimensions and pick the largest by area.
+            // Use i64 arithmetic to avoid overflow in debug builds.
+            let largest = pixmaps
+                .into_iter()
+                .filter(|(w, h, _)| *w > 0 && *h > 0)
+                .max_by_key(|(w, h, _)| (*w as i64).saturating_mul(*h as i64));
+
+            if let Some((width, height, data)) = largest {
                 (Some(data), width as u32, height as u32)
             } else {
                 (None, 0, 0)
@@ -650,7 +701,13 @@ pub async fn watch_name_changes(
         while let Some(signal) = name_owner_changed.next().await {
             if let Ok(args) = signal.args() {
                 // If new_owner is empty, the name was released
-                if args.new_owner.is_none() || args.new_owner.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                if args.new_owner.is_none()
+                    || args
+                        .new_owner
+                        .as_ref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true)
+                {
                     let name = args.name.to_string();
 
                     // Remove any items using this D-Bus name as their bus_name
@@ -679,7 +736,8 @@ mod tests {
     #[test]
     fn test_parse_service_string_unique_name_with_colon_separator() {
         // Spotify/Ayatana format: :1.75:/org/ayatana/NotificationItem/spotify_client
-        let (bus, path) = parse_service_string(":1.75:/org/ayatana/NotificationItem/spotify_client");
+        let (bus, path) =
+            parse_service_string(":1.75:/org/ayatana/NotificationItem/spotify_client");
         assert_eq!(bus, ":1.75");
         assert_eq!(path, "/org/ayatana/NotificationItem/spotify_client");
     }
@@ -703,7 +761,8 @@ mod tests {
     #[test]
     fn test_parse_service_string_well_known_with_path() {
         // Well-known name with path separator
-        let (bus, path) = parse_service_string("org.kde.StatusNotifierItem-1234-1:/StatusNotifierItem");
+        let (bus, path) =
+            parse_service_string("org.kde.StatusNotifierItem-1234-1:/StatusNotifierItem");
         assert_eq!(bus, "org.kde.StatusNotifierItem-1234-1");
         assert_eq!(path, "/StatusNotifierItem");
     }

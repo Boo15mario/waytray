@@ -43,15 +43,18 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     tracing::info!("Loaded configuration from {:?}", Config::config_path());
 
-    // Connect to the session bus
-    let connection = Connection::session().await?;
-    tracing::info!("Connected to session D-Bus");
+    // Use separate session-bus connections for control-plane vs tray/SNI traffic.
+    // This prevents noisy tray updates (e.g. Nextcloud sync storms) from starving
+    // client-facing daemon RPC calls on org.waytray.Daemon.
+    let tray_connection = Connection::session().await?;
+    let client_connection = Connection::session().await?;
+    tracing::info!("Connected to session D-Bus (tray + client connections)");
 
     // Create shared state for the SNI watcher
     let watcher_state = WatcherState::new();
 
-    // Start our watcher if no external one exists
-    let _owns_watcher = watcher::start_watcher(&connection, watcher_state.clone()).await?;
+    // Start our watcher if no external one exists (on tray connection)
+    let _owns_watcher = watcher::start_watcher(&tray_connection, watcher_state.clone()).await?;
 
     // Create notification service
     let notification_service = NotificationService::new(
@@ -61,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create the module registry with configured order
     let module_order = config.module_order();
-    let mut registry = ModuleRegistry::new(module_order, notification_service, connection.clone());
+    let mut registry = ModuleRegistry::new(module_order, notification_service, tray_connection.clone());
 
     // Register module factories
     register_module_factories(&mut registry);
@@ -74,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("All modules started");
 
     // Start the daemon D-Bus service for clients
-    dbus_service::start_service_with_registry(&connection, registry.clone()).await?;
+    dbus_service::start_service_with_registry(&client_connection, registry.clone()).await?;
 
     // Start config file watcher for hot reload
     let config_path = Config::config_path();

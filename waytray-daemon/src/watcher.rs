@@ -85,15 +85,21 @@ impl StatusNotifierWatcher {
             service.to_string()
         };
 
-        tracing::info!("Registering StatusNotifierItem: {}", full_service);
-
-        {
+        let is_new = {
             let mut items = self.state.registered_items.write().await;
-            items.insert(full_service.clone());
-        }
+            items.insert(full_service.clone())
+        };
 
-        // Emit signal
-        Self::status_notifier_item_registered(&emitter, &full_service).await?;
+        if is_new {
+            tracing::info!("Registering StatusNotifierItem: {}", full_service);
+            // Emit signal only on first registration.
+            Self::status_notifier_item_registered(&emitter, &full_service).await?;
+        } else {
+            tracing::debug!(
+                "Ignoring duplicate StatusNotifierItem registration: {}",
+                full_service
+            );
+        }
 
         Ok(())
     }
@@ -167,7 +173,10 @@ impl StatusNotifierWatcher {
 pub async fn external_watcher_exists(connection: &Connection) -> bool {
     let dbus = DBusProxy::new(connection).await.ok();
     if let Some(proxy) = dbus {
-        proxy.name_has_owner(WATCHER_BUS_NAME.try_into().unwrap()).await.unwrap_or(false)
+        proxy
+            .name_has_owner(WATCHER_BUS_NAME.try_into().unwrap())
+            .await
+            .unwrap_or(false)
     } else {
         false
     }

@@ -30,8 +30,9 @@ impl ItemCache {
         self.change_tx.subscribe()
     }
 
-    /// Add or update an item in the cache
-    pub async fn upsert(&self, item: TrayItem) {
+    /// Add or update an item in the cache.
+    /// Returns true if this was a new item, false if it already existed.
+    pub async fn upsert(&self, item: TrayItem) -> bool {
         let id = item.id.clone();
         let mut items = self.items.write().await;
         let is_new = !items.contains_key(&id);
@@ -45,6 +46,7 @@ impl ItemCache {
 
         // Ignore send errors (no receivers)
         let _ = self.change_tx.send(event);
+        is_new
     }
 
     /// Remove an item from the cache
@@ -118,8 +120,10 @@ impl ItemCache {
     pub async fn update_title(&self, id: &str, title: String) {
         let mut items = self.items.write().await;
         if let Some(item) = items.get_mut(id) {
-            item.title = title;
-            let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            if item.title != title {
+                item.title = title;
+                let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            }
         }
     }
 
@@ -127,8 +131,10 @@ impl ItemCache {
     pub async fn update_status(&self, id: &str, status: crate::ItemStatus) {
         let mut items = self.items.write().await;
         if let Some(item) = items.get_mut(id) {
-            item.status = status;
-            let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            if item.status != status {
+                item.status = status;
+                let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            }
         }
     }
 
@@ -143,11 +149,18 @@ impl ItemCache {
     ) {
         let mut items = self.items.write().await;
         if let Some(item) = items.get_mut(id) {
-            item.icon_name = icon_name;
-            item.icon_pixmap = icon_pixmap;
-            item.icon_width = width;
-            item.icon_height = height;
-            let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            let changed = item.icon_name != icon_name
+                || item.icon_pixmap != icon_pixmap
+                || item.icon_width != width
+                || item.icon_height != height;
+
+            if changed {
+                item.icon_name = icon_name;
+                item.icon_pixmap = icon_pixmap;
+                item.icon_width = width;
+                item.icon_height = height;
+                let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            }
         }
     }
 
@@ -155,8 +168,10 @@ impl ItemCache {
     pub async fn update_tooltip(&self, id: &str, tooltip: Option<String>) {
         let mut items = self.items.write().await;
         if let Some(item) = items.get_mut(id) {
-            item.tooltip = tooltip;
-            let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            if item.tooltip != tooltip {
+                item.tooltip = tooltip;
+                let _ = self.change_tx.send(CacheEvent::ItemUpdated(id.to_string()));
+            }
         }
     }
 

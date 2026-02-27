@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// A module item that can be displayed in the panel
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleItem {
     /// Unique identifier in format "{module_name}:{item_id}"
     pub id: String,
@@ -71,7 +71,7 @@ impl ModuleItem {
 }
 
 /// An action that can be performed on a module item
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ItemAction {
     /// Unique identifier for this action
     pub id: String,
