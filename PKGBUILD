@@ -15,19 +15,19 @@ sha256sums=('5a9e2652cb0ec252305c55087212500193466b94a1701710e751937b63b87223')
 
 prepare() {
     cd "$pkgname-$pkgver"
+    # Fix: ring 0.17 asm incompatibility with Rust 1.94+ lld linker
+    # Replace rustls-tls with native-tls to avoid ring dependency (must be before generate-lockfile)
+    sed -i 's/features = \["json", "rustls-tls"\]/features = ["json", "native-tls"]/' waytray-daemon/Cargo.toml
     # Generate Cargo.lock since it's not in the source tarball
     cargo generate-lockfile
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
-    # Fix: ring 0.17 asm incompatibility with Rust 1.94+ lld linker
-    # Replace rustls-tls with native-tls to avoid ring dependency
-    sed -i 's/features = \["json", "rustls-tls"\]/features = ["json", "native-tls"]/' waytray-daemon/Cargo.toml
 }
 
 build() {
     cd "$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
-    cargo build --release --frozen --all-features
+    cargo build --release --locked --all-features
 }
 
 check() {
