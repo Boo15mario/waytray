@@ -1,8 +1,8 @@
 # Maintainer: Boo_mario <boo15mario.com>
 pkgname=waytray
 pkgver=1.0.1
-pkgrel=2
-pkgdesc="Wayland system tray with daemon/client architecture (forked, fixed rustls-tls -> native-tls)"
+pkgrel=3
+pkgdesc="Wayland system tray with daemon/client architecture (forked, built with Rust 1.85)"
 arch=('aarch64' 'x86_64')
 url="https://github.com/Boo15mario/waytray"
 license=('MIT')
@@ -10,7 +10,7 @@ depends=('gtk4' 'gstreamer' 'dbus')
 makedepends=('rust' 'cargo')
 optdepends=('pipewire-pulse: for audio volume control module'
             'power-profiles-daemon: for power profile switching')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/destructatron/waytray/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/boo15mario/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('5a9e2652cb0ec252305c55087212500193466b94a1701710e751937b63b87223')
 
 prepare() {
@@ -25,14 +25,14 @@ prepare() {
 
 build() {
     cd "$pkgname-$pkgver"
-    export RUSTUP_TOOLCHAIN=stable
+    export RUSTUP_TOOLCHAIN=1.85.0
     export CARGO_TARGET_DIR=target
     cargo build --release --locked --all-features
 }
 
 check() {
     cd "$pkgname-$pkgver"
-    export RUSTUP_TOOLCHAIN=stable
+    export RUSTUP_TOOLCHAIN=1.85.0
     cargo test --release --frozen --all-features
 }
 
